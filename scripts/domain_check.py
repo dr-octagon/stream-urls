@@ -7,8 +7,9 @@ and updates urls.json automatically.
 
 import json
 import os
+import re
 import sys
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 try:
     from curl_cffi import requests as session
@@ -64,57 +65,148 @@ def save_urls(data):
         f.write("\n")
 
 
-def check_url_cffi(url, timeout=12):
-    """Check URL with curl_cffi and return redirect destination if changed."""
-    try:
-        resp = session.get(
-            url,
-            headers=HEADERS,
-            timeout=timeout,
-            allow_redirects=True,
-            impersonate="chrome120",
-            verify=False,
-        )
-        final_url = str(resp.url)
-        final_parsed = urlparse(final_url)
-        original_parsed = urlparse(url)
+def probe_numeric_domain(url):
+    """If a numeric pattern domain like dizipal1581.com is dead or not redirecting,
+    probe +1, +2, +3 to detect active successors.
+    """
+    m = re.match(r"^(https?://(?:www\.)?[a-zA-Z]+)(\d+)(\.[a-z]+)$", url)
+    if not m:
+        return None
+    prefix, num_str, suffix = m.groups()
+    base_num = int(num_str)
+    for offset in range(1, 4):
+        test_url = f"{prefix}{base_num + offset}{suffix}"
+        try:
+            if USE_CFFI:
+                resp = session.get(
+                    test_url,
+                    headers=HEADERS,
+                    timeout=5,
+                    allow_redirects=False,
+                    impersonate="chrome120",
+                    verify=False,
+                )
+                status = resp.status_code
+                loc = resp.headers.get("location") or resp.headers.get("Location")
+            else:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                req = urllib.request.Request(test_url, headers=HEADERS)
+                resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+                status = resp.getcode()
+                loc = resp.headers.get("location")
+            if status < 500 or loc:
+                print(f"  [PROBE SUCCESS] Found active successor: {test_url} (HTTP {status})")
+                return test_url
+        except Exception:
+            continue
+    return None
 
-        if resp.status_code < 400:
-            if final_parsed.netloc and final_parsed.netloc != original_parsed.netloc:
-                new_base = f"{final_parsed.scheme}://{final_parsed.netloc}"
-                return new_base, True
+
+def check_url_cffi(url, timeout=8):
+    """Check URL with curl_cffi and return redirect destination if changed.
+    Uses step-by-step redirect tracking without blind follow so that 301/302
+    redirects are captured even when destination servers block datacenter IPs (Cloudflare 403).
+    """
+    cur = url
+    changed = False
+
+    for _ in range(5):
+        try:
+            resp = session.get(
+                cur,
+                headers=HEADERS,
+                timeout=timeout,
+                allow_redirects=False,
+                impersonate="chrome120",
+                verify=False,
+            )
+            loc = resp.headers.get("location") or resp.headers.get("Location")
+            if resp.status_code in (301, 302, 303, 307, 308) and loc:
+                target = urljoin(cur, loc)
+                target_parsed = urlparse(target)
+                cur_parsed = urlparse(cur)
+                if target_parsed.netloc and target_parsed.netloc != cur_parsed.netloc:
+                    new_base = f"{target_parsed.scheme}://{target_parsed.netloc}"
+                    print(f"  [REDIRECT] {cur} -> {new_base} (HTTP {resp.status_code})")
+                    cur = new_base
+                    changed = True
+                    continue
+                else:
+                    cur = target
+                    continue
+
+            if changed:
+                return cur, True
             return url, False
-        else:
-            print(f"  [WARN] HTTP {resp.status_code} — {url}")
+        except Exception as e:
+            if changed:
+                return cur, True
+            print(f"  [WARN] Request to {cur} failed: {e}")
+            break
+
+    if not changed:
+        probed = probe_numeric_domain(url)
+        if probed:
+            return probed, True
+
+    return (cur, True) if changed else (url, False)
+
+
+def check_url_fallback(url, timeout=8):
+    """Fallback standard urllib check with redirect tracking and probing."""
+    cur = url
+    changed = False
+
+    class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(NoRedirectHandler)
+
+    for _ in range(5):
+        try:
+            req = urllib.request.Request(cur, headers=HEADERS)
+            resp = opener.open(req, timeout=timeout)
+            if changed:
+                return cur, True
             return url, False
-    except Exception as e:
-        print(f"  [ERROR] Connection failed: {url} — {e}")
-        return url, False
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("location")
+            if e.code in (301, 302, 303, 307, 308) and loc:
+                target = urljoin(cur, loc)
+                target_parsed = urlparse(target)
+                cur_parsed = urlparse(cur)
+                if target_parsed.netloc and target_parsed.netloc != cur_parsed.netloc:
+                    new_base = f"{target_parsed.scheme}://{target_parsed.netloc}"
+                    print(f"  [REDIRECT] {cur} -> {new_base} (HTTP {e.code})")
+                    cur = new_base
+                    changed = True
+                    continue
+                else:
+                    cur = target
+                    continue
+            if changed:
+                return cur, True
+            break
+        except Exception as e:
+            if changed:
+                return cur, True
+            break
+
+    if not changed:
+        probed = probe_numeric_domain(url)
+        if probed:
+            return probed, True
+
+    return (cur, True) if changed else (url, False)
 
 
-def check_url_fallback(url, timeout=12):
-    """Fallback standard urllib check."""
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        req = urllib.request.Request(url, headers=HEADERS)
-        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
-        final_url = resp.geturl()
-        final_parsed = urlparse(final_url)
-        original_parsed = urlparse(url)
-
-        if final_parsed.netloc and final_parsed.netloc != original_parsed.netloc:
-            new_base = f"{final_parsed.scheme}://{final_parsed.netloc}"
-            return new_base, True
-        return url, False
-    except Exception as e:
-        print(f"  [ERROR] Connection failed: {url} — {e}")
-        return url, False
-
-
-def check_url(url, timeout=12):
+def check_url(url, timeout=8):
     if USE_CFFI:
         return check_url_cffi(url, timeout)
     return check_url_fallback(url, timeout)
