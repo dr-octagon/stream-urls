@@ -53,6 +53,8 @@ PROVIDERS = {
     "fullhdfilmizlesene": {"test": "/arama/gladiator"},
     "tvdiziler":          {"test": "/search?qr=medcezir"},
     "dizimom":            {"test": "/?s=test"},
+    "cinejoy":            {"test": "/"},
+    "cinejoy_api":        {"test": "/servers"},
 }
 
 HEADERS = {
